@@ -33,6 +33,7 @@ class Config:
         self.target_field_idx = -1 # Target Item �? DNN 特征�?的索�?
         self.seq_vocab_size = 0   # 序列特征�? Vocab Size
         self.max_len = args.max_len
+        self.use_pid = False      # 是否使用 PID
 
 def train(args):
     config = Config(args)
@@ -42,8 +43,8 @@ def train(args):
     print(f"Loading data from {root_path}...")
     
     # 加载两个 Dataset (会消耗较多时间加�? Maps)
-    train_dataset = TaobaoDataset(root_path, mode='train', max_len=config.max_len, use_sid=args.use_sid)
-    test_dataset = TaobaoDataset(root_path, mode='test', max_len=config.max_len, use_sid=args.use_sid)
+    train_dataset = TaobaoDataset(root_path, mode='train', max_len=config.max_len, use_sid=args.use_sid, use_pid=args.use_pid)
+    test_dataset = TaobaoDataset(root_path, mode='test', max_len=config.max_len, use_sid=args.use_sid, use_pid=args.use_pid)
     
     # 2.? Dataset 获取维度配置
     print("Configuring Model Dimensions...")
@@ -88,9 +89,15 @@ def train(args):
     print(f"Target Index: {config.target_field_idx} ({target_col_name})")
     print(f"Seq Vocab Size: {config.seq_vocab_size}")
 
+    # 传递 PID 数据到 Config
+    config.use_pid = args.use_pid
+    if args.use_pid:
+        config.pid_lookup = train_dataset.pid_lookup_table
+        config.pid_sim_lookup = train_dataset.pid_sim_table
+        
     # 3. 创建 DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
     # 4. 初�?�化模型
     model = DCNV2(config).to(config.device)
@@ -114,10 +121,19 @@ def train(args):
 
             optimizer.zero_grad()
             
-            # Forward
-            pred = model(dnn_feat, seq_feat, seq_mask)
+            # Forward 接收 Loss
+            if config.use_pid:
+                pred, aux_loss = model(dnn_feat, seq_feat, seq_mask)
+                loss = criterion(pred, label) + aux_loss # 直接相加，也可以加权重 alpha
+            else:
+                # 兼容旧逻辑
+                result = model(dnn_feat, seq_feat, seq_mask)
+                if isinstance(result, tuple):
+                    pred, _ = result
+                else:
+                    pred = result
+                loss = criterion(pred, label)
             
-            loss = criterion(pred, label)
             loss.backward()
             optimizer.step()
             
@@ -167,13 +183,21 @@ if __name__ == '__main__':
     parser.add_argument('--epoch', type=int, default=30)
     parser.add_argument('--l2_reg', type=float, default=1e-3)
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--max_len', type=int, default=5) # 序列最大长度
+    parser.add_argument('--max_len', type=int, default=50) # 序列最大长度
     parser.add_argument('--use_sid', action='store_true', default=True, 
                     help='Use Semantic ID (default: enabled)')
     parser.add_argument('--no_use_sid', action='store_false', dest='use_sid',
                     help='Disable Semantic ID (override default enabled)')
-
+    parser.add_argument('--use_pid', action='store_true', default=False)
     args = parser.parse_args()
+    
+    # 互斥检查
+    if args.use_sid and args.use_pid:
+        print("Warning: Both SID and PID enabled. Combining them or prioritizing PID depends on implementation details.")
+        # 这里建议强制互斥
+        args.use_sid = False 
+        print("Disabling SID to use PID.")
+
     seed = 2026
     random.seed(seed)
     np.random.seed(seed)
@@ -182,3 +206,4 @@ if __name__ == '__main__':
     torch.backends.cudnn.benchmark = False   
     os.environ['PYTHONHASHSEED'] = str(seed)
     train(args)
+)
