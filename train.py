@@ -39,7 +39,8 @@ def train(args):
     config = Config(args)
     
     # 1. 加载数据
-    root_path = "/var/tmp/lhy_datasets/Taobao-MM/mini_dataset" # �?需要这一级目�?
+    #root_path = "/var/tmp/lhy_datasets/Taobao-MM/mini_dataset" # �?需要这一级目�?
+    root_path = "/data/cbn01/mid_dataset" # 直接指向 mini_dataset
     print(f"Loading data from {root_path}...")
     
     # 加载两个 Dataset (会消耗较多时间加�? Maps)
@@ -96,8 +97,8 @@ def train(args):
         config.pid_sim_lookup = train_dataset.pid_sim_table
         
     # 3. 创建 DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     # 4. 初�?�化模型
     model = DCNV2(config).to(config.device)
@@ -106,6 +107,11 @@ def train(args):
 
     best_auc = 0.0
 
+    # 定义模型保存路径 (修改这里)
+    save_dir = "/data/cbn01/checkpoints" # 使用大容量盘
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, 'best_model.pth')
+    
     print("Start Training...")
     for epoch in range(config.epoch):
         model.train()
@@ -152,8 +158,9 @@ def train(args):
 
         if auc > best_auc:
             best_auc = auc
-            torch.save(model.state_dict(), 'best_model.pth')
-            print("Best model saved.")
+            # 修改保存路径
+            torch.save(model.state_dict(), save_path) 
+            print(f"Best model saved to {save_path}")
 
 def evaluate(model, loader, device):
     model.eval()
@@ -174,16 +181,16 @@ def evaluate(model, loader, device):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--lr', type=float, default=0.0005)
+    parser.add_argument('--batch_size', type=int, default=5120)
     parser.add_argument('--embedding_size', type=int, default=16)
     parser.add_argument('--depth', type=int, default=2)
-    parser.add_argument('--mlp', type=int, nargs='+', default=[256, 128,64])
+    parser.add_argument('--mlp', type=int, nargs='+', default=[512, 512,512])
     parser.add_argument('--dropout', type=float, default=0.01)
     parser.add_argument('--epoch', type=int, default=30)
-    parser.add_argument('--l2_reg', type=float, default=1e-3)
-    parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--max_len', type=int, default=50) # 序列最大长度
+    parser.add_argument('--l2_reg', type=float, default=1e-5)
+    parser.add_argument('--gpu', type=int, default=1)
+    parser.add_argument('--max_len', type=int, default=200) # 序列最大长度
     parser.add_argument('--use_sid', action='store_true', default=True, 
                     help='Use Semantic ID (default: enabled)')
     parser.add_argument('--no_use_sid', action='store_false', dest='use_sid',
@@ -206,4 +213,4 @@ if __name__ == '__main__':
     torch.backends.cudnn.benchmark = False   
     os.environ['PYTHONHASHSEED'] = str(seed)
     train(args)
-)
+

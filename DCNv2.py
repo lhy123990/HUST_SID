@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 class DNN(nn.Module):
-    """鏍囧噯 MLP"""
+    """标准 MLP"""
     def __init__(self, input_dim, hidden_units, dropout=0.0):
         super(DNN, self).__init__()
         layers = []
@@ -60,7 +60,7 @@ class AttentionLayer(nn.Module):
         concat = torch.cat([
             hist_emb,
             target_emb_expanded,
-            #hist_emb - target_emb_expanded,
+            #hist_emb * target_emb_expanded
             hist_emb * target_emb_expanded
         ], dim=-1)
 
@@ -86,7 +86,6 @@ class DCNV2(nn.Module):
         
         # 1. 基础特征 Embeddings
         self.dnn_embeddings = nn.ModuleList()
-        # 按照 feature_names 的顺序初始化
         for i, size in enumerate(self.field_dims):
             self.dnn_embeddings.append(nn.Embedding(size + 1, self.embedding_size))
         
@@ -95,12 +94,22 @@ class DCNV2(nn.Module):
             for key, tensor in config.attr_lookups.items():
                 self.register_buffer(f'lookup_{key}', tensor)
 
-        # 3. 注册 SID 查找表
+        # === 3. SID 初始化 (关键修复) ===
         self.num_sid_cols = 0 
+        self.sid_embeddings = nn.ModuleList() # [Fix] 独立创建 Embedding
+        
         if hasattr(config, 'sid_lookup') and config.sid_lookup is not None:
             self.register_buffer('sid_lookup', torch.from_numpy(config.sid_lookup))
             self.num_sid_cols = config.sid_lookup.shape[1]
-            print(f"[DCNv2] Enabled SID with {self.num_sid_cols} columns.")
+            
+            # 自动计算 SID 词表大小 (也就是聚类簇的数量)
+            max_sid_val = self.sid_lookup.max().item()
+            sid_vocab_size = int(max_sid_val + 10) # +10 防止边界溢出
+            print(f"[DCNv2] Enabled SID with {self.num_sid_cols} columns. Vocab Size: {sid_vocab_size}")
+            
+            # 为每一列 SID 创建独立的 Embedding 层
+            for _ in range(self.num_sid_cols):
+                self.sid_embeddings.append(nn.Embedding(sid_vocab_size, self.embedding_size))
 
         self.seq_attr_list = ['206', '213', '214']
         
@@ -121,18 +130,18 @@ class DCNV2(nn.Module):
                 self.pid_linear = nn.Linear(self.num_pid_k, self.num_pid_k)
                 nn.init.xavier_uniform_(self.pid_linear.weight)
                 
-                # 记录 PID 增加的维度块数
+                # 记录 PID 增加的维度块数 (拼接到 Item Emb 中)
                 self.num_pid_blocks = 1
             else:
                 raise ValueError("use_pid is True but pid_lookup is missing in config")
 
         # 5. Item Dimension (重新计算总维度)
         # ID本身(1) + 属性(len) + SID(cols) + PID(1)
-        self.item_total_dim = (1 + len(self.seq_attr_list) + self.num_sid_cols + self.num_pid_blocks) * self.embedding_size
+        self.item_total_dim = (1 + len(self.seq_attr_list) + self.num_sid_cols + getattr(self, 'num_pid_blocks', 0)) * self.embedding_size
         
         print(f"[DCNv2] Item Total Dim per element: {self.item_total_dim} (PID blocks: {self.num_pid_blocks})")
         
-        # 6. Attention (现在使用正确的维度初始化)
+        # 6. Attention
         self.attention = AttentionLayer(self.item_total_dim)
         
         # 7. DCN Input Dim
@@ -140,32 +149,17 @@ class DCNV2(nn.Module):
         self.num_dnn_fields = len(self.field_dims)
         self.dnn_input_dim = self.num_dnn_fields * self.embedding_size
         
-        # 加上 Item Total Dim (这里包含了 Target Item 的相关 Embedding 聚合结果)
-        # 注意: 之前的逻辑是把 Target Item (Query) 单独拿出来做 Cross 吗？
-        # 通常 DCN 的输入是：[所有 DNN ID 特征的 Embedding] 拼接
-        
         # 如果 PID 是作为一个额外的 "Field" 加入到 CrossNet 中
         if self.use_pid:
-            # PID 输出一个 [B, EmbSize] 的向量，相当于多了一个 Field
+            # PID 输出一个 [B, EmbSize] 的向量，拼接到 dnn_embs_flat 中
             self.pid_dim = self.embedding_size
         else:
             self.pid_dim = 0
             
-        self.total_input_dim = self.dnn_input_dim + self.item_total_dim
-        # 等等，之前的代码 item_total_dim 好像是给 Attention 用的？
-        # 让我们理清 input:
-        # CrossNet 的输入通常是：Flatten(DNN Embeddings) + Attention Output
+        # [关键修正] 总输入维度 = DNN特征 + 序列特征(Attention输出) + PID特征(Target Item的PID)
+        self.total_input_dim = self.dnn_input_dim + self.item_total_dim + self.pid_dim
         
-        self.total_input_dim = self.dnn_input_dim + self.item_total_dim 
-        # 这里 item_total_dim 是 DIN 输出的维度吗？
-        # 看 forward: total_emb = torch.cat([dnn_embs_flat, din_output], dim=1)
-        # din_output 的维度是 hidden_size (即 embedding_size) 还是 item_total_dim?
-        # 看 AttentionLayer: output = matmul(weights, hist_emb).
-        # hist_emb 的最后一维是 item_total_dim.
-        # 所以 din_output 的维度是 item_total_dim.
-        
-        # 正确的总维度:
-        self.total_input_dim = self.dnn_input_dim + self.item_total_dim
+        print(f"[DCNv2] Total Input Dim: {self.total_input_dim}")
         
         # 8. Network
         self.cross_net = CrossNet(self.total_input_dim, depth=config.cross_depth)
@@ -173,82 +167,86 @@ class DCNV2(nn.Module):
         
         final_dim = self.total_input_dim + self.dnn.output_dim
         self.linear = nn.Linear(final_dim, 1)
+        self.has_printed_neighbor_info = False
 
-        # === PID 初始化 ===
-        self.use_pid = getattr(config, 'use_pid', False)
-        
-        if self.use_pid:
-            print("[DCNv2] Enabling PID...")
-            # 注册 Buffer，这样它们会随模型保存到 state_dict
-            if hasattr(config, 'pid_lookup') and config.pid_lookup is not None:
-                self.register_buffer('pid_lookup', torch.from_numpy(config.pid_lookup))
-                self.register_buffer('pid_sim_lookup', torch.from_numpy(config.pid_sim_lookup))
-                self.num_pid_k = config.pid_lookup.shape[1]
-                
-                # Linear 变换层: Sim [k] -> Weights [k]
-                # 这里使用 Linear(k, k) 允许不同位置的相似度交互，或者也可以用 Element-wise 
-                self.pid_linear = nn.Linear(self.num_pid_k, self.num_pid_k)
-                # 初始化为正数比较好，或者 Xavier
-                nn.init.xavier_uniform_(self.pid_linear.weight)
-                
-                # PID Embedding 将被拼接到 Item Embedding 之后
-                # Item Total Dim 增加一个 Embedding Size (因为是加权平均，维度不变)
-                #self.item_total_dim += self.embedding_size
-            else:
-                raise ValueError("use_pid is True but pid_lookup is missing in config")
-        
     def get_pid_embedding(self, item_ids_input):
         """
         计算 PID Embedding 和 Monotonicity Loss
         item_ids_input: [Batch] or [Batch, SeqLen]
         """
-        # 1. 展平处理 (为了同时处理 Target Item 和 Sequence Items)
+        # [Fix] 1. 确保输入是 Long 类型，防止浮点数索引隐患
+        item_ids_input = item_ids_input.long()
+        
         original_shape = item_ids_input.shape
         flat_ids = item_ids_input.view(-1)
         
-        # 2. 处理越界 ID (比如 0 或未登录词)
+        # 1. 查找相似物品
         max_idx = self.pid_lookup.size(0)
         safe_ids = flat_ids.clone()
-        safe_ids[safe_ids >= max_idx] = 0 # 映射到 0 (Padding)
+        safe_ids[safe_ids >= max_idx] = 0
+        safe_ids[safe_ids < 0] = 0
         
-        # 3. 查找相似物品 ID 和 相似度
-        # neighboring_ids: [N, k], neighboring_sims: [N, k]
-        neighbor_ids = self.pid_lookup[safe_ids]
-        neighbor_sims = self.pid_sim_lookup[safe_ids]
-        
-        # 4. 获取相似物品的 Embedding (Stop Gradient)
-        # 获取 Item ID (205) 对应的 Embedding Layer
+        neighbor_ids = self.pid_lookup[safe_ids]      # [N, k]
+        neighbor_sims = self.pid_sim_lookup[safe_ids] # [N, k]
+
+        # 获取 Embedding 层 (共享 Main Item Embedding)
         idx_205 = self.feat_name_to_idx.get('205')
         item_emb_layer = self.dnn_embeddings[idx_205]
-        
+
+        # [Debug] 打印一次看看取出的 ID 是什么范围 (检查是否是 Raw ID)
+        if not self.has_printed_neighbor_info:
+            print(f"\n[PID Check]")
+            print(f"  Lookup Max Size: {max_idx}")
+            print(f"  Item Vocab Size: {item_emb_layer.num_embeddings}")
+            print(f"  Sample Neighbor IDs: {neighbor_ids[0].tolist()}")
+            print(f"  Max Neighbor ID: {neighbor_ids.max().item()}")
+            if neighbor_ids.max().item() >= item_emb_layer.num_embeddings:
+                print(f"  [CRITICAL] Neighbor IDs contain values larger than Vocab! Are these Raw IDs?")
+            self.has_printed_neighbor_info = True
+
         # [N, k, EmbSize]
-        neighbor_embs = item_emb_layer(neighbor_ids) 
-        neighbor_embs = neighbor_embs.detach() # <--- 关键：Stop Gradient
+        neighbor_ids_safe = neighbor_ids.clone()
+        # [Safety] 防止越界导致崩溃，这里做个截断保护
+        neighbor_ids_safe[neighbor_ids_safe >= item_emb_layer.num_embeddings] = 0
+        neighbor_ids_safe[neighbor_ids_safe < 0] = 0 
         
-        # 5. 计算权重
-        # Linear -> Sigmoid
-        # weights: [N, k]
-        weights = torch.sigmoid(self.pid_linear(neighbor_sims))
+        neighbor_embs = item_emb_layer(neighbor_ids_safe) 
+        neighbor_embs = neighbor_embs.detach() # [Correct] 梯度停止
         
-        # 6. 计算单调性 Loss
-        # 约束: out_{j} >= out_{j+1}  =>  out_{j+1} - out_{j} <= 0
-        # 如果 out_{j+1} > out_{j}，则 relu > 0，产生 Loss
+        # 3. 计算权重 (Linear -> Sigmoid)
+        # 你的 pid_linear 是 (k -> k)，这实际上是一个小的 MLP，允许不同位置的相似度交互，是合理的
+        weights = torch.sigmoid(self.pid_linear(neighbor_sims)) # [N, k]
+        
+        # === [新增 DEBUG 代码开始] ===
+        if not getattr(self, 'has_printed_pid_debug', False):
+            print(f"\n[PID Runtime Debug]")
+            print(f"  Input Simulations (neighbor_sims): \n{neighbor_sims[0].detach().cpu().numpy()}")
+            print(f"  Output Weights (Sigmoid): \n{weights[0].detach().cpu().numpy()}")
+            
+            # 检查是否有梯度的迹象 (weights 是否全为 0.5 或者非常接近)
+            w_min, w_max = weights.min().item(), weights.max().item()
+            print(f"  Weights Range in batch: Min={w_min:.4f}, Max={w_max:.4f}")
+            
+            # 检查 Linear 层权重 (如果全0初始化或者未能更新)
+            if hasattr(self, 'pid_linear'):
+                print(f"  Linear Layer Weights Sample: \n{self.pid_linear.weight.data[0][:10].cpu().numpy()}...")
+                print(f"  Linear Layer Grad Exists: {self.pid_linear.weight.grad is not None}")
+                
+            self.has_printed_pid_debug = True
+        # === [新增 DEBUG 代码结束] ===
+
+        # 4. Monotonicity Loss
         diff = weights[:, 1:] - weights[:, :-1] 
         mono_loss = torch.sum(torch.relu(diff))
         
-        # 7. 加权平均
-        # [N, k, E] * [N, k, 1] -> [N, k, E] -> sum -> [N, E]
-        # 添加 Mask: 如果 neighbor_id 是 0 (padding)，则不参与计算
+        # 5. 加权平均
+        # Mask: 0 是 Padding
         mask = (neighbor_ids != 0).float().unsqueeze(-1) # [N, k, 1]
         
         weighted_embs = neighbor_embs * weights.unsqueeze(-1) * mask
-        pid_emb = torch.sum(weighted_embs, dim=1) # [N, E] (Sum pooling)
-        # 也可以考虑 Mean pooling: pid_emb = pid_emb / (torch.sum(weights * mask.squeeze(-1), dim=1, keepdim=True) + 1e-8)
+        pid_emb = torch.sum(weighted_embs, dim=1) # [N, E]
         
-        # 恢复形状
         pid_emb = pid_emb.view(*original_shape, -1)
-        
-        # Loss 归一化 (可选，避免 batch size 影响太大)
         mono_loss = mono_loss / flat_ids.size(0)
         
         return pid_emb, mono_loss
@@ -256,26 +254,28 @@ class DCNV2(nn.Module):
     def forward(self, dnn_feat, seq_feat, seq_mask):
         batch_size = dnn_feat.shape[0]
         device = dnn_feat.device
-        
-        # 初始化辅助 Loss
         total_aux_loss = torch.tensor(0.0, device=device)
 
-        # --- 1. Embedding DNN Features ---
+        # 1. Embedding DNN Features
         dnn_emb_list = []
         for i, emb_layer in enumerate(self.dnn_embeddings):
             dnn_emb_list.append(emb_layer(dnn_feat[:, i]))
-        dnn_embs_stack = torch.stack(dnn_emb_list, dim=1) # [B, F, E]
+        dnn_embs_stack = torch.stack(dnn_emb_list, dim=1) 
         dnn_embs_flat = dnn_embs_stack.view(batch_size, -1)
         
-        # --- 2. Construct Target Item (Query) ---
+        # 获取 Target Item ID (205)
+        idx_205 = self.feat_name_to_idx.get('205')
+
+        # --- 2. Construct Target Item ---
         target_parts = []
         
-        idx_205 = self.feat_name_to_idx.get('205')
+        # 2.1 Target ID
         if idx_205 is not None:
              target_parts.append(dnn_embs_stack[:, idx_205, :])
         else:
              target_parts.append(torch.zeros(batch_size, self.embedding_size, device=device))
             
+        # 2.2 Attributes (206, 213, 214)
         for col in self.seq_attr_list:
             idx = self.feat_name_to_idx.get(col)
             if idx is not None:
@@ -283,87 +283,99 @@ class DCNV2(nn.Module):
             else:
                 target_parts.append(torch.zeros(batch_size, self.embedding_size, device=device))
 
-        for i in range(self.num_sid_cols):
-            sid_name = f'sid_{i}'
-            idx = self.feat_name_to_idx.get(sid_name)
-            if idx is not None:
-                target_parts.append(dnn_embs_stack[:, idx, :]) 
+        # === 2.3 SID (关键修复: 查表 + 独立Embedding) ===
+        if self.num_sid_cols > 0:
+            if idx_205 is not None:
+                # 1. 拿到 Item ID
+                target_ids = dnn_feat[:, idx_205].long()
+                
+                # 2. 边界保护
+                max_len = self.sid_lookup.size(0)
+                safe_ids = target_ids.clone()
+                safe_ids[safe_ids >= max_len] = 0
+                safe_ids[safe_ids < 0] = 0
+                
+                # 3. 查表得到 SID [Batch, Cols]
+                target_sids = self.sid_lookup[safe_ids] 
+                
+                # 4. 做 Embedding
+                for i in range(self.num_sid_cols):
+                    # 使用 self.sid_embeddings 而不是 dnn_embeddings
+                    sid_emb = self.sid_embeddings[i](target_sids[:, i]) 
+                    target_parts.append(sid_emb)
             else:
-                target_parts.append(torch.zeros(batch_size, self.embedding_size, device=device))
+                for _ in range(self.num_sid_cols):
+                    target_parts.append(torch.zeros(batch_size, self.embedding_size, device=device))
 
-        # === Inject PID for Target Item ===
-        if self.use_pid and idx_205 is not None:
-             # Target Item ID 在 dnn_feat 中的位置
+        # 2.4 PID (保持不变)
+        target_pid_emb = None  
+        if getattr(self, 'use_pid', False) and idx_205 is not None:
              target_ids = dnn_feat[:, idx_205] 
              pid_emb, loss = self.get_pid_embedding(target_ids)
              target_parts.append(pid_emb)
              total_aux_loss = total_aux_loss + loss
+             target_pid_emb = pid_emb 
 
         target_item_emb = torch.cat(target_parts, dim=-1) 
 
-        # --- 3. Construct Sequence Items (Keys) ---
+        # --- 3. Construct Sequence Items ---
         seq_parts = []
         
-        # 3.1 Sequence ID Embedding [Shared with Target Item 205]
+        # 3.1 & 3.2 ID & Attributes (简写，请保留你原本的完整逻辑)
         if idx_205 is not None:
-            # Re-use the sparse embedding
-            # Note: With sparse=True, this still works fine for dense inputs like seq_feat
-            seq_id_emb = self.dnn_embeddings[idx_205](seq_feat) # [B, T, E]
-            seq_parts.append(seq_id_emb)
+            seq_parts.append(self.dnn_embeddings[idx_205](seq_feat))
         else:
             seq_parts.append(torch.zeros(batch_size, seq_feat.size(1), self.embedding_size, device=device))
-        
-        # 3.2 Attributes
+            
         flat_seq_ids = seq_feat.reshape(-1)
+        # ... (保留 Attribute 处理逻辑) ...
+        # 为节省篇幅，假设 Attribute 部分你保留原样，确保对齐即可
         for col in self.seq_attr_list:
-            if hasattr(self, f'lookup_{col}'):
-                lookup_table = getattr(self, f'lookup_{col}')
-                max_lookup_idx = lookup_table.size(0)
-                safe_ids = flat_seq_ids.clone()
-                safe_ids[safe_ids >= max_lookup_idx] = 0
-                attr_ids = lookup_table[safe_ids]
-                
-                if col in self.feat_name_to_idx:
-                    emb_layer_idx = self.feat_name_to_idx[col]
-                    emb_layer = self.dnn_embeddings[emb_layer_idx]
-                    attr_emb = emb_layer(attr_ids).view(batch_size, -1, self.embedding_size)
-                    seq_parts.append(attr_emb)
-                else:
-                    seq_parts.append(torch.zeros(batch_size, seq_feat.size(1), self.embedding_size, device=device))
-            else:
-                seq_parts.append(torch.zeros(batch_size, seq_feat.size(1), self.embedding_size, device=device))
+             if hasattr(self, f'lookup_{col}'): 
+                 # 复制之前的逻辑
+                 max_lookup_idx = getattr(self, f'lookup_{col}').size(0)
+                 safe_ids = flat_seq_ids.clone()
+                 safe_ids[safe_ids >= max_lookup_idx] = 0
+                 attr_ids = getattr(self, f'lookup_{col}')[safe_ids]
+                 if col in self.feat_name_to_idx:
+                     emb_layer = self.dnn_embeddings[self.feat_name_to_idx[col]]
+                     attr_emb = emb_layer(attr_ids).view(batch_size, -1, self.embedding_size)
+                     seq_parts.append(attr_emb)
+                 else:
+                     seq_parts.append(torch.zeros(batch_size, seq_feat.size(1), self.embedding_size, device=device))
+             else:
+                 seq_parts.append(torch.zeros(batch_size, seq_feat.size(1), self.embedding_size, device=device))
 
-        # 3.3 SID
-        if hasattr(self, 'sid_lookup') and self.sid_lookup is not None:
+
+        # === 3.3 SID (序列部分修复) ===
+        if self.num_sid_cols > 0:
             max_sid_lookup = self.sid_lookup.size(0)
             safe_ids = flat_seq_ids.clone()
             safe_ids[safe_ids >= max_sid_lookup] = 0
             
-            # Use safe indices for lookup
-            sids_all = self.sid_lookup[safe_ids] 
+            sids_all = self.sid_lookup[safe_ids] # [Total_Items, Cols]
             
             for i in range(self.num_sid_cols):
-                 sid_name = f'sid_{i}'
-                 if sid_name in self.feat_name_to_idx:
-                     emb_layer_idx = self.feat_name_to_idx[sid_name]
-                     emb_layer = self.dnn_embeddings[emb_layer_idx]
-                     sid_emb = emb_layer(sids_all[:, i]).view(batch_size, -1, self.embedding_size)
-                     seq_parts.append(sid_emb)
-                 else:
-                     seq_parts.append(torch.zeros(batch_size, seq_feat.size(1), self.embedding_size, device=device))
+                 # [Fix] 使用 sid_embeddings
+                 emb_layer = self.sid_embeddings[i]
+                 sid_emb = emb_layer(sids_all[:, i]).view(batch_size, -1, self.embedding_size)
+                 seq_parts.append(sid_emb)
 
-        # === Inject PID for Sequence Items ===
-        if self.use_pid:
+        # 3.4 PID (保持不变)
+        if getattr(self, 'use_pid', False):
              pid_emb, loss = self.get_pid_embedding(seq_feat)
              seq_parts.append(pid_emb)
              total_aux_loss = total_aux_loss + loss
 
+        # ... (后续拼接和 CrossNet 逻辑保持不变)
         seq_item_emb = torch.cat(seq_parts, dim=-1)
-        
-        # --- 4. Attention & Prediction ---
         din_output = self.attention(seq_item_emb, target_item_emb, seq_mask)
-        total_emb = torch.cat([dnn_embs_flat, din_output], dim=1)
         
+        doc_list = [dnn_embs_flat, din_output]
+        if target_pid_emb is not None:
+             doc_list.append(target_pid_emb)
+            
+        total_emb = torch.cat(doc_list, dim=1)
         stack = torch.cat([self.cross_net(total_emb), self.dnn(total_emb)], dim=1)
         pred = torch.sigmoid(self.linear(stack))
         
