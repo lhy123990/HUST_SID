@@ -189,7 +189,7 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.01)
     parser.add_argument('--epoch', type=int, default=30)
     parser.add_argument('--l2_reg', type=float, default=1e-5)
-    parser.add_argument('--gpu', type=int, default=1)
+    parser.add_argument('--gpu', type=int, default=2)
     parser.add_argument('--max_len', type=int, default=200) # 序列最大长度
     parser.add_argument('--use_sid', action='store_true', default=True, 
                     help='Use Semantic ID (default: enabled)')
