@@ -1,5 +1,5 @@
 # 假�?�上面的 SCLDataset 已经定义
-# 假�?? RQVAE 类在 rqvae.py �??
+# 假�?? RQVAE 类在 rqvae.py �???
 from SCLDataset import SCLDataset
 import numpy as np
 import pandas as pd
@@ -94,25 +94,25 @@ def train_rqvae(args):
     # latent_dim      -> e_dim
     # num_codebooks & codebook_size -> num_emb_list
     
-    # args.mlp_dim �?? [128],  Encoder结构变成: [Input] -> [128] -> [Latent]
+    # args.mlp_dim �??? [128],  Encoder结构变成: [Input] -> [128] -> [Latent]
     
     model = RQVAE(
         in_dim=input_dim,
         num_emb_list=codebook_sizes,  # 对应 [64, 128, 128]
         e_dim=args.latent_dim,        # 对应 128
-        layers=args.mlp_dim,          # <--- �?改这里：去掉�?�?�?
+        layers=args.mlp_dim,          # <--- �??改这里：去掉�??�??�??
         dropout_prob=0.0,
-        bn=True,                   # 推荐开�?? BN 以稳定�??�??
+        bn=True,                   # 推荐开�??? BN 以稳定�??�???
         loss_type="mse",
         quant_loss_weight=1.0,
         beta=0.2,
-        kmeans_init=False,             # 开?? K-Means 初?化以加速收??
+        kmeans_init=False,             # 开?? K-Means �??化以加速收??
         kmeans_iters=0
     ).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     
-    # 3. �??�??
+    # 3. �???�???
     print("Start Training RQ-VAE...")
     model.train()
     for epoch in range(args.epoch):
@@ -151,7 +151,7 @@ def train_rqvae(args):
     torch.save(model.state_dict(), "rqvae_model.pth")
     print("Model saved.")
     
-    # 4. 生成并保�?? Semantic IDs
+    # 4. 生成并保�??? Semantic IDs
     save_semantic_ids(model, dataset, args.output_dir, device, args.batch_size)
 
 def save_semantic_ids(model, dataset, output_dir, device, batch_size):
@@ -194,10 +194,10 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='/data/cbn01/mid_dataset/feature_map')
     parser.add_argument('--lr', type=float, default=0.0001, dest='learning_rate')
     parser.add_argument('--batch_size', type=int, default=1024)
-    parser.add_argument('--epoch', type=int, default=4) 
+    parser.add_argument('--epoch', type=int, default=15) 
     
     # Updated args for structure
-    parser.add_argument('--codebook_structure', type=int, nargs='+', default=[128,128])
+    parser.add_argument('--codebook_structure', type=int, nargs='+', default=[200,200,200])
     parser.add_argument('--mlp_dim',  type=int, nargs='+', default=[128,64], help="SIDTierMLPDimension")
     parser.add_argument('--latent_dim', type=int, default=16, help="Latent Dimension")
 
