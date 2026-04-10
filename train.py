@@ -8,8 +8,8 @@ import numpy as np
 import os
 import sys
 
-# 引入�?改后�? Model �? Dataloader
-# 假�?�你�? model 文件名为 DCNv2.py, dataloader 文件名为 dataloaderx.py
+# 引入�??改后�?? Model �?? Dataloader
+# 假�?�你�?? model 文件名为 DCNv2.py, dataloader 文件名为 dataloaderx.py
 from DCNv2 import DCNV2
 from dataloaderx import TaobaoDataset 
 
@@ -28,50 +28,53 @@ class Config:
         self.l2_reg = args.l2_reg
         self.device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
         
-        # 特征参数 (�? Dataset 动态填�?)
-        self.field_dims = []      # 每个 DNN 特征�? Vocab Size
-        self.target_field_idx = -1 # Target Item �? DNN 特征�?的索�?
-        self.seq_vocab_size = 0   # 序列特征�? Vocab Size
+        # 特征参数 (�?? Dataset 动态填�??)
+        self.field_dims = []      # 每个 DNN 特征�?? Vocab Size
+        self.target_field_idx = -1 # Target Item �?? DNN 特征�??的索�??
+        self.seq_vocab_size = 0   # 序列特征�?? Vocab Size
         self.max_len = args.max_len
-        self.use_pid = False      # 是否使用 PID
+        self.use_pid = False      # �?否使�? PID
+        self.pid_use_independent_emb = False
+        self.pid_distill = False
+        self.pid_distill_weight = 0.0
 
 def train(args):
     config = Config(args)
     
     # 1. 加载数据
-    #root_path = "/var/tmp/lhy_datasets/Taobao-MM/mini_dataset" # �?需要这一级目�?
+    #root_path = "/var/tmp/lhy_datasets/Taobao-MM/mini_dataset" # �??需要这一级目�??
     root_path = "/data/cbn01/mid_dataset" # 直接指向 mini_dataset
     print(f"Loading data from {root_path}...")
     
-    # 加载两个 Dataset (会消耗较多时间加�? Maps)
+    # 加载两个 Dataset (会消耗较多时间加�?? Maps)
     train_dataset = TaobaoDataset(root_path, mode='train', max_len=config.max_len, use_sid=args.use_sid, use_pid=args.use_pid)
     test_dataset = TaobaoDataset(root_path, mode='test', max_len=config.max_len, use_sid=args.use_sid, use_pid=args.use_pid)
     
     # 2.? Dataset 获取维度配置
     print("Configuring Model Dimensions...")
     
-    # 计算标量特征的维�? (field_dims)
-    # feature_names 已经�? Dataset 处理好了顺序
+    # 计算标量特征的维�?? (field_dims)
+    # feature_names 已经�?? Dataset 处理好了顺序
     config.field_dims = []
     
-    # 遍历所�? DNN 特征列名，查找�?�应�? Map 大小
+    # 遍历所�?? DNN 特征列名，查找�?�应�?? Map 大小
     for col in train_dataset.feature_names:
         if col in train_dataset.maps:
-            # Map 大小 + 1 (留给 0 �? Padding/Unknown)
+            # Map 大小 + 1 (留给 0 �?? Padding/Unknown)
             vocab = len(train_dataset.maps[col]) + 1
             config.field_dims.append(vocab)
         else:
-            # 万一没有 map (理�?�上不应发生)，给�?默�?�大�?
+            # 万一没有 map (理�?�上不应发生)，给�??默�?�大�??
             print(f"Warning: No map found for {col}, using default 100000")
             config.field_dims.append(100000)
             
-    # === 新增: 传递特征名和查找表 ===
+    # === 新�??: 传递特征名和查找表 ===
     config.feature_names = train_dataset.feature_names
     config.attr_lookups = train_dataset.attr_lookups
     config.sid_lookup = train_dataset.sid_lookup_table
     
-    # 找到 Target Item ID (205) 在特征列表中的索�?
-    # DIN 需要知道哪一列是 Target Item，以此作�? Query 注意力机�?
+    # 找到 Target Item ID (205) 在特征列表中的索�??
+    # DIN 需要知道哪一列是 Target Item，以此作�?? Query 注意力机�??
     target_col_name = '205' 
     try:
         config.target_field_idx = train_dataset.feature_names.index(target_col_name)
@@ -90,11 +93,17 @@ def train(args):
     print(f"Target Index: {config.target_field_idx} ({target_col_name})")
     print(f"Seq Vocab Size: {config.seq_vocab_size}")
 
-    # 传递 PID 数据到 Config
+    # 传�? PID 数据�? Config
     config.use_pid = args.use_pid
     if args.use_pid:
         config.pid_lookup = train_dataset.pid_lookup_table
         config.pid_sim_lookup = train_dataset.pid_sim_table
+        config.pid_basis_lookup = train_dataset.pid_basis_lookup_table
+        config.pid_use_independent_emb = args.pid_use_independent_emb
+        config.pid_distill = args.pid_distill
+        config.pid_distill_weight = args.pid_distill_weight
+        if args.pid_use_independent_emb and config.pid_basis_lookup is None:
+            raise ValueError("pid_use_independent_emb is enabled but pid_basis_lookup_table is missing from the dataset.")
         
     # 3. 创建 DataLoader
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
@@ -102,19 +111,58 @@ def train(args):
 
     # 4. 初�?�化模型
     model = DCNV2(config).to(config.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.l2_reg)
+    
+    if args.warm_start_path:
+        if os.path.exists(args.warm_start_path):
+            print(f"Loading pretrained embeddings from {args.warm_start_path}...")
+            checkpoint = torch.load(args.warm_start_path, map_location=config.device)
+            model_dict = model.state_dict()
+            
+            # �?加载 dnn_embeddings（过滤掉改变了结构的网络其他部分�?
+            pretrained_emb_dict = {
+                k: v for k, v in checkpoint.items() 
+                if 'dnn_embeddings' in k and k in model_dict and v.size() == model_dict[k].size()
+            }
+            
+            if len(pretrained_emb_dict) > 0:
+                model_dict.update(pretrained_emb_dict)
+                model.load_state_dict(model_dict)
+                print(f"Successfully warm-started {len(pretrained_emb_dict)} embedding layer tensors.")
+                
+                if args.freeze_emb:
+                    print("Freezing warmed-up dnn_embeddings...")
+                    for name, param in model.named_parameters():
+                        if 'dnn_embeddings' in name:
+                            param.requires_grad = False
+            else:
+                print("Warning: No matching dnn_embeddings found.")
+        else:
+            print(f"Warning: Pretrained path {args.warm_start_path} does not exist.")
+
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), 
+        lr=config.learning_rate, 
+        weight_decay=config.l2_reg
+    )
     criterion = nn.BCELoss()
 
     best_auc = 0.0
 
-    # 定义模型保存路径 (修改这里)
-    save_dir = "/data/cbn01/checkpoints" # 使用大容量盘
+    # 定义模型保存�?�? (�?改这�?)
+    save_dir = "/data/cbn01/checkpoints" # 使用大�?�量�?
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, 'best_model.pth')
     
     print("Start Training...")
     for epoch in range(config.epoch):
         model.train()
+
+        if config.use_pid:
+     
+
+            # �? DCNv2 在本 epoch �?一�? PID 前向时打印一�? case
+            model.has_printed_pid_debug = False
+
         total_loss = 0
         steps = 0
         
@@ -130,9 +178,9 @@ def train(args):
             # Forward 接收 Loss
             if config.use_pid:
                 pred, aux_loss = model(dnn_feat, seq_feat, seq_mask)
-                loss = criterion(pred, label) + aux_loss # 直接相加，也可以加权重 alpha
+                loss = criterion(pred, label) + aux_loss # 直接相加，也�?以加权重 alpha
             else:
-                # 兼容旧逻辑
+                # 兼�?�旧逻辑
                 result = model(dnn_feat, seq_feat, seq_mask)
                 if isinstance(result, tuple):
                     pred, _ = result
@@ -158,7 +206,7 @@ def train(args):
 
         if auc > best_auc:
             best_auc = auc
-            # 修改保存路径
+            # �?改保存路�?
             torch.save(model.state_dict(), save_path) 
             print(f"Best model saved to {save_path}")
 
@@ -174,6 +222,9 @@ def evaluate(model, loader, device):
             
             pred = model(dnn_feat, seq_feat, seq_mask)
             
+            if isinstance(pred, tuple):
+                pred = pred[0]
+                
             preds.extend(pred.cpu().numpy().flatten())
             labels.extend(label.numpy().flatten())
 
@@ -187,23 +238,40 @@ if __name__ == '__main__':
     parser.add_argument('--depth', type=int, default=2)
     parser.add_argument('--mlp', type=int, nargs='+', default=[512, 512,512])
     parser.add_argument('--dropout', type=float, default=0.01)
-    parser.add_argument('--epoch', type=int, default=30)
-    parser.add_argument('--l2_reg', type=float, default=1e-5)
-    parser.add_argument('--gpu', type=int, default=2)
-    parser.add_argument('--max_len', type=int, default=200) # 序列最大长度
+    parser.add_argument('--epoch', type=int, default=4)
+    parser.add_argument('--l2_reg', type=float, default=1e-5) 
+    parser.add_argument('--gpu', type=int, default=1)
+    parser.add_argument('--max_len', type=int, default=200) # 序列最大长�?
     parser.add_argument('--use_sid', action='store_true', default=True, 
                     help='Use Semantic ID (default: enabled)')
     parser.add_argument('--no_use_sid', action='store_false', dest='use_sid',
                     help='Disable Semantic ID (override default enabled)')
     parser.add_argument('--use_pid', action='store_true', default=False)
+    parser.add_argument('--pid_use_independent_emb', action='store_true', default=False,
+                        help='Use a separate embedding table for PID basis ids instead of reusing the 205 item embedding')
+    parser.add_argument('--pid_distill', action='store_true', default=False,
+                        help='Add cosine distillation loss between basis PID embeddings and their 205 item embeddings')
+    parser.add_argument('--pid_distill_weight', type=float, default=0.01,
+                        help='Weight for the PID basis distillation loss')
+    
+    # === 新�?�控制热�?的参�? ===
+    parser.add_argument('--warm_start_path', type=str, default=False, 
+                    help='/data/cbn01/checkpoints/cold_model.pth   False')
+    parser.add_argument('--freeze_emb', action='store_true', default=False, 
+                    help='Freeze the warm-started DNN embeddings')
+                    
     args = parser.parse_args()
     
-    # 互斥检查
+    # 互斥检�?
     if args.use_sid and args.use_pid:
         print("Warning: Both SID and PID enabled. Combining them or prioritizing PID depends on implementation details.")
-        # 这里建议强制互斥
+        # 这里建�??强制互斥
         args.use_sid = False 
         print("Disabling SID to use PID.")
+
+    if args.pid_distill and not args.use_pid:
+        print("Warning: pid_distill is enabled but use_pid is False. Disabling pid_distill.")
+        args.pid_distill = False
 
     seed = 2026
     random.seed(seed)
